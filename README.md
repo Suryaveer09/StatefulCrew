@@ -48,7 +48,7 @@ Each phase folder has its own short README covering what was built and what brok
 
 ```bash
 # Clone and enter the repo
-git clone <your-repo-url>
+git clone https://github.com/Suryaveer09/StatefulCrew.git
 cd StatefulCrew
 
 # Create and activate the conda environment
