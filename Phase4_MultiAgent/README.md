@@ -9,6 +9,7 @@ This phase produced the hardest debugging of the whole project — five distinct
 | File | What it demonstrates |
 |---|---|
 | `multi_agent_crew.py` | The full supervisor + 3-specialist crew: routing via tool calls, schema-grounded SQL agent, sanitized inter-agent context |
+| `images/sanitized_supervisor_context.png` | LangSmith trace proving the Bug 4 fix — see below |
 
 ## Architecture
 
@@ -52,6 +53,12 @@ This is the harder category — the graph completed successfully but produced a 
 
 **Bug 4 — The Supervisor imitated another agent's tool call.** With crashing fixed, a defensive print revealed the Supervisor's own LLM call had requested `run_sql_query` — a tool never bound to it (`router_llm` only knows about `route`). Root cause: `state["messages"]` is shared across the whole crew, so by the Supervisor's second turn, its context already contained the SQL Agent's real `run_sql_query` tool-call JSON from earlier in the loop. DeepSeek appears to have pattern-matched and imitated that literal tool-call structure instead of respecting its own actual tool schema.
 > Fix: built `build_supervisor_context()` — strips raw `tool_calls` and `ToolMessage` objects out of what the Supervisor sees, replacing them with plain-text summaries (`"[sql_agent used a tool: run_sql_query]"`) before they ever reach its prompt. No literal tool-call JSON from other agents = nothing to imitate.
+
+**Verified, not just asserted.** Rather than take the fix on faith, I pulled up the actual LangSmith trace and clicked into the raw `ChatDeepSeek` API call for the Supervisor's second turn (the one right after `sql_agent` runs) to see the literal payload sent to DeepSeek:
+
+![Sanitized supervisor context](./images/sanitized_supervisor_context.png)
+
+The input shows `[agent used a tool: run_sql_query]` and `[Tool result]: Genre, TotalSales ('Rock', 826.65)...` as plain user-role text — no raw `tool_calls` JSON anywhere for the model to imitate. The output confirms the payoff: `route` called cleanly with `next_agent: analysis_agent`. This is the difference between a node's Python-level state (always unsanitized, since `build_supervisor_context()` only creates a local copy for the LLM call) and the actual API request — the two look different, and only the second one is the real evidence.
 
 **Bug 5 — The SQL Agent hallucinated a table name.** `SQL Error: no such table: invoice_items`. The real Chinook table is `InvoiceLine`, not `invoice_items` — a plausible-sounding but incorrect guess, since the SQL Agent had zero schema information and was working entirely from training-data pattern matching about "typical" schemas. (The `report_agent`'s final answer had simply echoed this raw SQL error back as its "report" — not a crash, a complete but useless run.)
 > Fix: added an explicit `SQL_AGENT_SYSTEM_PROMPT` listing the real table and column names, prepended to every SQL Agent call. Standard real-world SQL agent practice: ground the model in the actual schema rather than letting it guess.
