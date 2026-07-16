@@ -4,6 +4,15 @@ from langchain_core.messages import HumanMessage
 
 from crew import build_graph, MAX_ITERATIONS
 
+# LangGraph's recursion_limit counts EVERY node execution (supervisor AND
+# specialists), not just supervisor iterations like our own MAX_ITERATIONS
+# does. Each supervisor->specialist round is 2 graph steps, and the forced
+# report_agent pass after hitting MAX_ITERATIONS adds a few more on top.
+# Deriving this from MAX_ITERATIONS (instead of a separate hardcoded
+# number) means the two guardrails can never drift out of sync again —
+# that mismatch is exactly what caused a GraphRecursionError here.
+RECURSION_LIMIT = (MAX_ITERATIONS * 2) + 5
+
 st.set_page_config(page_title="StatefulCrew", page_icon="🎵")
 st.title("🎵 StatefulCrew — Data Insights Assistant")
 st.caption(
@@ -55,7 +64,7 @@ if question:
         with st.spinner("Crew is working..."):
             config = {
                 "configurable": {"thread_id": st.session_state.thread_id},
-                "recursion_limit": 15,
+                "recursion_limit": RECURSION_LIMIT,
             }
             result = graph.invoke(
                 {"messages": [HumanMessage(question)], "iterations": 0},

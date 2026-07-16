@@ -14,7 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from dotenv import load_dotenv
 load_dotenv()
 
-DB_PATH = "../Phase2_Tools/chinook.db"
+DB_PATH = "../Phase2_Tools/chinook.db"  # Phase 6 folder structure — sibling to Phase2_Tools
 
 
 class CrewState(TypedDict):
@@ -29,9 +29,6 @@ MAX_ITERATIONS = 6
 llm = ChatDeepSeek(model="deepseek-v4-flash", temperature=0)
 
 
-# ─────────────────────────────────────────────────────────────────
-# Generic retry wrapper (Phase 5)
-# ─────────────────────────────────────────────────────────────────
 def invoke_with_retry(chain_or_llm, inputs, max_attempts: int = 3, node_name: str = "node"):
     last_error = None
     for attempt in range(1, max_attempts + 1):
@@ -44,17 +41,43 @@ def invoke_with_retry(chain_or_llm, inputs, max_attempts: int = 3, node_name: st
     raise last_error
 
 
-# ─────────────────────────────────────────────────────────────────
-# NEW: find the most recent user question, not the first one in a
-# growing multi-turn Streamlit session. Without this, analysis_agent
-# and report_agent kept re-answering the FIRST question ever asked in
-# the session instead of the current one — found via Phase 6 UI testing.
-# ─────────────────────────────────────────────────────────────────
 def get_latest_user_question(messages: list) -> str:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             return msg.content
     return ""
+
+
+# ─────────────────────────────────────────────────────────────────
+# GENERALIZED sanitizer — was previously only used for the supervisor
+# (build_supervisor_context). Renamed and now applied to EVERY node's
+# model call, not just the supervisor's. Root cause of a real regression
+# found via Streamlit multi-turn testing: with enough turns accumulated
+# in a long session, ANY node seeing raw tool_calls/ToolMessage objects
+# from earlier questions could imitate or leak that structure — not just
+# the supervisor. analysis_agent and report_agent aren't bound to any
+# tools, so when they tried to imitate one, it leaked out as literal
+# text in the final answer instead of being executed.
+# ─────────────────────────────────────────────────────────────────
+def build_sanitized_context(messages: list) -> list:
+    """Strip raw tool_calls/ToolMessage structures out of what any node's
+    model call sees, replacing them with plain-text summaries. Preserves
+    full session history (so follow-up questions still work) without ever
+    exposing raw tool-call JSON to a node that shouldn't act on it.
+    """
+    context = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            context.append(msg)
+        elif isinstance(msg, ToolMessage):
+            context.append(HumanMessage(content=f"[Tool result]: {msg.content[:300]}"))
+        elif isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                tool_names = ", ".join(c["name"] for c in msg.tool_calls)
+                context.append(HumanMessage(content=f"[{msg.name or 'agent'} used a tool: {tool_names}]"))
+            elif msg.content:
+                context.append(HumanMessage(content=f"[{msg.name or 'agent'} said]: {msg.content}"))
+    return context
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -76,34 +99,29 @@ SUPERVISOR_SYSTEM_PROMPT = SystemMessage(content=(
     "- report_agent: writes the final natural-language answer for the user\n"
     "Route to sql_agent first if no data has been fetched yet for the CURRENT question. "
     "Route to report_agent only once you have everything needed for a complete answer. "
-    "Call route with FINISH once report_agent has already produced the final answer."
+    "Call route with FINISH once report_agent has already produced the final answer.\n"
+    "If sql_agent explains that the schema doesn't contain the data needed to answer "
+    "the question, do NOT route back to sql_agent hoping for a different result — "
+    "route directly to report_agent so it can explain this limitation to the user."
 ))
-
-
-def build_supervisor_context(messages: list) -> list:
-    context = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            context.append(msg)
-        elif isinstance(msg, ToolMessage):
-            context.append(HumanMessage(content=f"[Tool result]: {msg.content[:300]}"))
-        elif isinstance(msg, AIMessage):
-            if msg.tool_calls:
-                tool_names = ", ".join(c["name"] for c in msg.tool_calls)
-                context.append(HumanMessage(content=f"[{msg.name or 'agent'} used a tool: {tool_names}]"))
-            elif msg.content:
-                context.append(HumanMessage(content=f"[{msg.name or 'agent'} said]: {msg.content}"))
-    return context
 
 
 def supervisor_node(state: CrewState) -> dict:
     iterations = state.get("iterations", 0) + 1
 
     if iterations > MAX_ITERATIONS:
-        print(f"Hit max iterations ({MAX_ITERATIONS}) — forcing FINISH to avoid an infinite loop.")
-        return {"next": "FINISH", "iterations": iterations}
+        # Never let FINISH skip report_agent — that's what caused raw tool
+        # dumps and bare "No rows returned." to reach the user directly.
+        # Force exactly one report_agent pass first, using whatever context
+        # exists so far, then truly finish next time around.
+        if state.get("next") != "report_agent":
+            print(f"Hit max iterations ({MAX_ITERATIONS}) — forcing one report_agent pass instead of a raw dump.")
+            return {"next": "report_agent", "iterations": iterations}
+        else:
+            print("Already forced a report_agent pass after max iterations — finishing now.")
+            return {"next": "FINISH", "iterations": iterations}
 
-    clean_context = build_supervisor_context(state["messages"])
+    clean_context = build_sanitized_context(state["messages"])
     ai_msg = invoke_with_retry(
         router_llm, [SUPERVISOR_SYSTEM_PROMPT] + clean_context, node_name="supervisor"
     )
@@ -123,7 +141,10 @@ def supervisor_node(state: CrewState) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# SQL Agent
+# SQL Agent — now also uses sanitized context. It never needed to see
+# raw tool_calls from EARLIER questions' SQL steps (each supervisor
+# cycle only calls it once), so this is a pure safety improvement with
+# no loss of needed reasoning.
 # ─────────────────────────────────────────────────────────────────
 SQL_AGENT_SYSTEM_PROMPT = SystemMessage(content=(
     "You write SQLite SELECT queries against the Chinook database. The real schema is:\n"
@@ -137,7 +158,13 @@ SQL_AGENT_SYSTEM_PROMPT = SystemMessage(content=(
     "Use exactly these table and column names — do not guess or invent names like "
     "'invoice_items'. For sales by genre, join Track -> InvoiceLine -> Genre.\n"
     "Always write a query that answers the user's MOST RECENT question in the "
-    "conversation, not an earlier one."
+    "conversation, not an earlier one.\n"
+    "IMPORTANT: Country/location only exists on the Customer table (a customer's "
+    "billing country) — there is NO country-of-origin field for tracks, artists, "
+    "albums, or genres. If a question asks for something this schema has no column "
+    "for, do NOT guess, search unrelated tables, or dump an entire table hoping for "
+    "a match. Instead, respond in plain text (no tool call) explaining exactly what "
+    "data is missing and why the question can't be answered from this schema."
 ))
 
 
@@ -164,8 +191,9 @@ sql_llm = llm.bind_tools([run_sql_query])
 
 
 def sql_agent_node(state: CrewState) -> dict:
+    clean_context = build_sanitized_context(state["messages"])
     ai_msg = invoke_with_retry(
-        sql_llm, [SQL_AGENT_SYSTEM_PROMPT] + state["messages"], node_name="sql_agent"
+        sql_llm, [SQL_AGENT_SYSTEM_PROMPT] + clean_context, node_name="sql_agent"
     )
     new_messages = [ai_msg]
     for call in ai_msg.tool_calls:
@@ -175,11 +203,12 @@ def sql_agent_node(state: CrewState) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Analysis + Report agents — now explicitly pointed at the LATEST
-# question instead of implicitly re-answering the first one in a
-# growing multi-turn session.
+# Analysis + Report agents — now sanitized too. This directly fixes the
+# raw "<|DSML|tool_calls>..." leak: with no raw tool_calls/ToolMessage
+# objects in their context anymore, there's nothing left to imitate.
 # ─────────────────────────────────────────────────────────────────
 def analysis_agent_node(state: CrewState) -> dict:
+    clean_context = build_sanitized_context(state["messages"])
     latest_question = get_latest_user_question(state["messages"])
     analysis_prompt = (
         f"The user's CURRENT question is: \"{latest_question}\"\n"
@@ -187,12 +216,13 @@ def analysis_agent_node(state: CrewState) -> dict:
         "notable relevant to THIS question specifically. Be brief."
     )
     response = invoke_with_retry(
-        llm, state["messages"] + [HumanMessage(analysis_prompt)], node_name="analysis_agent"
+        llm, clean_context + [HumanMessage(analysis_prompt)], node_name="analysis_agent"
     )
     return {"messages": [AIMessage(content=response.content, name="analysis_agent")]}
 
 
 def report_agent_node(state: CrewState) -> dict:
+    clean_context = build_sanitized_context(state["messages"])
     latest_question = get_latest_user_question(state["messages"])
     report_prompt = (
         f"The user's CURRENT question is: \"{latest_question}\"\n"
@@ -202,13 +232,13 @@ def report_agent_node(state: CrewState) -> dict:
         "must directly answer. Be concise and cite the actual numbers."
     )
     response = invoke_with_retry(
-        llm, state["messages"] + [HumanMessage(report_prompt)], node_name="report_agent"
+        llm, clean_context + [HumanMessage(report_prompt)], node_name="report_agent"
     )
     return {"messages": [AIMessage(content=response.content, name="report_agent")]}
 
 
 # ─────────────────────────────────────────────────────────────────
-# Graph builder — Streamlit imports and calls this once per session
+# Graph builder
 # ─────────────────────────────────────────────────────────────────
 def build_graph():
     """Builds and compiles the crew graph. Called once by the Streamlit app."""
