@@ -1,10 +1,12 @@
 # StatefulCrew
 
-A multi-agent data analytics assistant built to learn LangChain and LangGraph end-to-end — from a single LLM call to a supervisor-coordinated crew of specialist agents with persistent state.
+A multi-agent data analytics assistant built to learn LangChain and LangGraph end-to-end — from a single LLM call to a supervisor-coordinated crew of specialist agents, deployed live on Azure.
+
+**Live demo:** `https://statefulcrew-app.azurewebsites.net` *(stopped by default to avoid ongoing cost — see [Phase7_Deployment/README.md](./Phase7_Deployment/README.md) for how to start it)*
 
 ## Why this project exists
 
-I'm a Data Engineer (AWS, Spark, SQL, dbt-style pipelines) learning how to build agentic AI systems on top of the data platforms I already work with. Instead of following a single tutorial, I built this project in phases — each one a self-contained step, each one committed separately — so the repo itself shows the progression from "LLM call" to "working multi-agent system."
+I'm a Data Engineer (AWS, Spark, SQL, dbt-style pipelines) learning how to build agentic AI systems on top of the data platforms I already work with. Instead of following a single tutorial, I built this project in phases — each one a self-contained step, each one committed separately — so the repo itself shows the progression from "LLM call" to a working, deployed multi-agent system.
 
 The name **StatefulCrew** is literal: it's the one thing that separates LangGraph from a plain LangChain pipeline — a shared, persistent **state** object that a **crew** of agents reads from and writes to as they hand work back and forth.
 
@@ -13,11 +15,11 @@ The name **StatefulCrew** is literal: it's the one thing that separates LangGrap
 Ask a natural-language data question — e.g. *"What were the top 5 genres by total sales, and is there anything unusual about the numbers?"* — and a graph of agents handles it:
 
 - **Supervisor** — decides which specialist acts next, or whether the task is done
-- **SQL Agent** — writes and runs the actual database query, grounded in the real schema
+- **SQL Agent** — writes and runs the actual database query, grounded in the real schema, honest when the data can't answer the question
 - **Analysis Agent** — checks the results for patterns and anomalies
 - **Report Agent** — writes the final answer, citing the actual numbers
 
-All coordinated through a LangGraph `StateGraph`, with full execution traces in LangSmith.
+All coordinated through a LangGraph `StateGraph`, with full execution traces in LangSmith, wrapped in a Streamlit chat UI, containerized with Docker, and deployed on Azure.
 
 ## Tech stack
 
@@ -27,7 +29,8 @@ All coordinated through a LangGraph `StateGraph`, with full execution traces in 
 | Orchestration | LangChain + LangGraph | Industry-standard agent framework |
 | Observability | LangSmith | See every agent step, not just the final answer |
 | Database | SQLite (Chinook sample DB) | Zero-infra, focuses learning on the agents, not the infra |
-| Interface | Streamlit | Simple demoable chat UI |
+| Interface | Streamlit | Chat UI, containerized with Docker |
+| Cloud | Azure (App Service + Container Registry) | Targeted deliberately — matches the Azure requirement in the roles I'm applying to, distinct from my existing AWS background |
 | Environment | Conda | Isolated, reproducible Python env |
 
 ## Project structure — one phase per folder
@@ -39,10 +42,10 @@ All coordinated through a LangGraph `StateGraph`, with full execution traces in 
 | 3 | [`Phase3_LangGraphBasics/`](./Phase3_LangGraphBasics) | `StateGraph`, conditional edges, checkpointed memory |
 | 4 | [`Phase4_MultiAgent/`](./Phase4_MultiAgent) | Supervisor pattern, the full agent crew |
 | 5 | [`Phase5_Observability/`](./Phase5_Observability) | LangSmith tracing, guardrails, iteration limits |
-| 6 | [`Phase6_Interface/`](./Phase6_Interface) | Streamlit front end |
-| 7 | `Phase7_Deployment/` | Containerized, deployed on AWS |
+| 6 | [`Phase6_Interface/`](./Phase6_Interface) | Streamlit front end, multi-turn conversation bugs |
+| 7 | [`Phase7_Deployment/`](./Phase7_Deployment) | Docker containerization, Azure deployment |
 
-Each phase folder has its own short README covering what was built and what broke along the way — debugging real provider quirks turned out to be most of the actual learning.
+Each phase folder has its own README covering what was built and what broke along the way — debugging real provider quirks and cloud deployment issues turned out to be most of the actual learning.
 
 ## Setup
 
@@ -63,6 +66,8 @@ cp .env.example .env
 # then edit .env with your DEEPSEEK_API_KEY and LANGSMITH_API_KEY
 ```
 
+To run the deployed version locally instead: see [`Phase7_Deployment/README.md`](./Phase7_Deployment/README.md) for Docker build/run instructions.
+
 ## Environment variables
 
 ```
@@ -74,14 +79,23 @@ LANGSMITH_PROJECT=statefulcrew
 
 ## What I learned
 
-- **DeepSeek's V4 models default to "thinking mode,"** which breaks LangChain's standard structured-output method (`with_structured_output`, function-calling variant). Worked around it in Phase 1 using `method="json_mode"` with an explicit schema description in the prompt.
-- **`json_mode` is not reliable enough for every use case, even after tuning.** In Phase 4, the Supervisor's routing decision failed under `json_mode` in two different ways (empty content, then whitespace-only content) even after disabling thinking mode and setting `max_tokens`. The real fix was switching the routing mechanism to a tool call — the same mechanism that had been 100% reliable since Phase 2 — rather than continuing to tune a fragile approach. Lesson: when a fix changes a bug's *shape* without removing it, that's a signal to change strategy, not keep adjusting parameters.
-- **Shared state in a multi-agent graph cuts both ways.** It's what makes agent handoff simple — every node sees the same state, no manual message-passing needed. But it also means a node can see things it was never meant to. In Phase 4, the Supervisor's own LLM call started imitating another agent's real tool-call JSON (`run_sql_query`) simply because that literal tool-call structure was sitting in the shared message history, even though `run_sql_query` was never bound to the Supervisor's own model. The fix was sanitizing what each node actually receives — stripping raw tool-call structures into plain-text summaries before they reach a node that shouldn't be acting on them. This was the single most non-obvious bug in the project so far: correct-looking code, wrong result, and the root cause was an architectural assumption (shared state = safe to share raw) rather than a syntax or config error.
-- **A node's Python-level state and the actual API call are two different things to inspect.** Phase 5's LangSmith trace work confirmed the Phase 4 sanitization fix, but only after realizing that a node's own Input/Output tab always shows raw, unsanitized state — the real evidence is one level deeper, in the nested model-call span. Verifying a fix by reading a trace at the wrong level can *look* like the fix failed when it didn't.
-- **A CLI test suite and a real UI test different things.** Building the Phase 6 Streamlit interface surfaced two bugs — dollar signs rendering as broken LaTeX, and every answer re-anchoring on the *first* question in a growing session instead of the current one — that six clean single-question CLI runs across Phases 4-5 never revealed. Both bugs only exist *because* of sustained multi-turn state and markdown rendering, neither of which the CLI script ever exercised.
+- **DeepSeek's V4 models default to "thinking mode,"** which breaks LangChain's standard structured-output method. Worked around it in Phase 1 using `method="json_mode"` with an explicit schema description in the prompt.
+- **`json_mode` is not reliable enough for every use case, even after tuning.** In Phase 4, the Supervisor's routing decision failed under `json_mode` in two different ways even after disabling thinking mode and setting `max_tokens`. The real fix was switching to a tool call — the same mechanism that had been 100% reliable since Phase 2. When a fix changes a bug's *shape* without removing it, that's a signal to change strategy, not keep adjusting parameters.
+- **Shared state in a multi-agent graph cuts both ways.** It's what makes agent handoff simple, but it also means a node can see things it was never meant to. The Supervisor's own LLM call started imitating another agent's real tool-call JSON simply because that structure was sitting in shared history. The fix — sanitizing what each node actually receives — was the single most non-obvious bug in the project: correct-looking code, wrong result, and the root cause was an architectural assumption, not a syntax error.
+- **A node's Python-level state and the actual API call are two different things to inspect.** Verifying the sanitization fix via LangSmith required going one level deeper than a node's own Input/Output tab, into the nested model-call span — the node's own state view always looks unsanitized by design.
+- **A CLI test suite and a real UI test different things.** Building the Streamlit interface surfaced bugs — dollar signs rendering as broken LaTeX, answers re-anchoring on the first question in a growing session — that six clean single-question CLI runs never revealed, because neither bug could exist without sustained multi-turn state.
+- **Fixing one bug can unmask the next layer down.** Sanitizing context (fixing a leak) exposed a missing graceful-failure path, and fixing *that* broke a completely separate, un-synced guardrail (LangGraph's `recursion_limit` vs. the crew's own `MAX_ITERATIONS`). None of this meant the approach was wrong — it's the normal shape of debugging a system with several interacting safety mechanisms. Deriving one guardrail from the other, instead of hardcoding both separately, closed that gap for good.
+- **A working local Docker container doesn't guarantee a working cloud deployment.** Every actual Azure deployment bug — unregistered resource providers, a transient resource lock, a placeholder API key that slipped through — was specific to the cloud environment and invisible to local testing, even after thorough local validation.
+- **Testing for a limitation and documenting it honestly beats hiding it.** A deliberate prompt-injection test on the live Azure deployment found a real gap — the crew complied with "ignore previous instructions" instead of staying on-task. Left undocumented, that's a landmine for later. Written up openly, it's evidence of genuine adversarial testing rather than a suspiciously perfect record.
 
-Full writeups with the debugging process in each phase's own README — [`Phase1_Basics/README.md`](./Phase1_Basics/README.md), [`Phase2_Tools/README.md`](./Phase2_Tools/README.md), [`Phase3_LangGraphBasics/README.md`](./Phase3_LangGraphBasics/README.md), [`Phase4_MultiAgent/README.md`](./Phase4_MultiAgent/README.md), [`Phase5_Observability/README.md`](./Phase5_Observability/README.md), [`Phase6_Interface/README.md`](./Phase6_Interface/README.md).
+Full writeups with the debugging process in each phase's own README — [`Phase1_Basics/README.md`](./Phase1_Basics/README.md), [`Phase2_Tools/README.md`](./Phase2_Tools/README.md), [`Phase3_LangGraphBasics/README.md`](./Phase3_LangGraphBasics/README.md), [`Phase4_MultiAgent/README.md`](./Phase4_MultiAgent/README.md), [`Phase5_Observability/README.md`](./Phase5_Observability/README.md), [`Phase6_Interface/README.md`](./Phase6_Interface/README.md), [`Phase7_Deployment/README.md`](./Phase7_Deployment/README.md).
+
+## Known limitations
+
+- **No defense against prompt injection or off-topic instructions.** Found via deliberate adversarial testing in Phase 7 — no system prompt currently tells any agent how to handle a request that tries to override its instructions. Not fixed, by choice, to keep this phase focused on deployment rather than opening a new prompt-hardening phase — but documented rather than hidden.
+- **SQLite, not a production database.** Chosen deliberately to keep the learning focus on the agent architecture rather than database infrastructure. A "real" production version would use Azure SQL or PostgreSQL.
+- **Single-model setup.** Every agent uses the same `deepseek-v4-flash` model. A more cost/quality-optimized version might use a smaller model for routing and a stronger one for analysis/report writing.
 
 ## Status
 
-🚧 In progress — currently on Phase 7 (Deployment).
+✅ Core project complete — Phases 1 through 7 built, debugged, and deployed. The live app is stopped by default (see Phase 7's README for cost details and how to start it for a demo).
